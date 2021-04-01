@@ -1,0 +1,3 @@
+[submodule "components/art-netinterface"]
+	path = components/art-netinterface
+	url = git@bitbucket.org:BetterWayLighting/art-netinterface.git
