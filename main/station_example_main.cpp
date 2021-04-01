@@ -14,6 +14,7 @@ extern "C" {
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -21,6 +22,8 @@ extern "C" {
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "Art_Net.hpp"
+#include "dmx.h"
+#include "driver/gpio.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -33,6 +36,8 @@ extern "C" {
 #define EXAMPLE_ESP_WIFI_SSID      "Trace Mountains"
 #define EXAMPLE_ESP_WIFI_PASS      "turntwice"
 #define EXAMPLE_ESP_MAXIMUM_RETRY  5
+
+static const gpio_num_t dmx_tx_pin = GPIO_NUM_18;
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
@@ -131,11 +136,53 @@ static void wifi_init_sta(void)
     vEventGroupDelete(s_wifi_event_group);
 }
 
-static void data_rx(uint8_t *data, int len){
-    ESP_LOGI(TAG, "data received[%d] { %d, %d ...}", len, data[0], data[1]);
+ArtNetBaseClass<0, 1> artnet;
+esp_dmx_t dmx;
+
+SemaphoreHandle_t arrive_sem;
+uint8_t arrive_buf[512] = { 0 };
+int arrive_len = 0;
+SemaphoreHandle_t out_sem;
+uint8_t out_buf[513] = { 0 };
+int out_len = 0;
+TaskHandle_t copy_task_h = nullptr;
+
+void copy_task(void *arg){
+    while(true){
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        //ESP_LOGI(TAG, "copy task");
+        // Wait on the output sem first
+        xSemaphoreTake(out_sem, portMAX_DELAY);
+        xSemaphoreTake(arrive_sem, portMAX_DELAY);
+
+        memcpy(out_buf + 1, arrive_buf, arrive_len);
+        out_len = arrive_len;
+
+        xSemaphoreGive(arrive_sem);
+        xSemaphoreGive(out_sem);
+    }
 }
 
-ArtNetBaseClass<0, 1> artnet;
+void data_rx(uint8_t *data, int len){
+    xSemaphoreTake(arrive_sem, portMAX_DELAY);
+    memcpy(arrive_buf, data, len);
+    arrive_len = len;
+    xSemaphoreGive(arrive_sem);
+    xTaskNotifyGive(copy_task_h);
+}
+
+static uint8_t *dmx_buf_cb(void *arg, uint16_t *frame_sz){
+    xSemaphoreTake(out_sem, portMAX_DELAY);
+    ESP_LOGI(TAG, "tx [%d] = {%d %d ...", out_len, out_buf[0], out_buf[1]);
+    *frame_sz = out_len;
+    return out_buf;
+} 
+
+static void post_dmx_cb(void *arg){
+    ESP_LOGI(TAG, "post tx");
+    xSemaphoreGive(out_sem);
+} 
 
 void app_main(void)
 {
@@ -149,6 +196,33 @@ void app_main(void)
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
+
+    arrive_sem = xSemaphoreCreateMutex();
+    out_sem = xSemaphoreCreateBinary();
+    xSemaphoreGive(out_sem);
+    xTaskCreate(copy_task, "copyTask", 2048, NULL, tskIDLE_PRIORITY+1, &copy_task_h);
+
+
+    esp_dmx_init_cfg_t dmx_cfg = ESP_DMX_INIT_CFG_DEFAULT();
+    dmx_cfg.uart = UART_NUM_1;
+    esp_dmx_tx_cfg_t dmx_tx_cfg = ESP_DMX_INIT_TX_DEFAULT();
+    dmx_tx_cfg.pin_tx = dmx_tx_pin;
+    dmx_tx_cfg.sync = esp_dmx_sync_stream;
+    dmx_tx_cfg.tx_timer_group = TIMER_GROUP_0;
+    dmx_tx_cfg.tx_timer_idx = TIMER_0;
+    dmx_tx_cfg.tx_buf_cb = dmx_buf_cb;
+    dmx_tx_cfg.post_tx_cb = post_dmx_cb;
+    esp_err_t err = esp_dmx_init(&dmx, &dmx_cfg, NULL, &dmx_tx_cfg);
+    if(err){
+        ESP_LOGE(TAG, "errror initializing transmitter %d", err);
+        return;
+    }
+
+    err = esp_dmx_start(&dmx);
+    if(err){
+        ESP_LOGE(TAG, "errror starting dmx %d", err);
+        return;
+    }
 
     // Configure Art-Net
     artnet.begin(ST_NODE);

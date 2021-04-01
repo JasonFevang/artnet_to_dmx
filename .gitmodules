@@ -1,3 +1,6 @@
 [submodule "components/art-netinterface"]
 	path = components/art-netinterface
 	url = git@bitbucket.org:BetterWayLighting/art-netinterface.git
+[submodule "components/esp-dmx"]
+	path = components/esp-dmx
+	url = git@bitbucket.org:BetterWayLighting/esp-dmx.git
