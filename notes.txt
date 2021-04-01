@@ -1,0 +1,10 @@
+Connections:
+esp32 pin 18 to stm8 pin 31, UART2_RX
+esp32 gnd pin to stm8 Vss
+esp32 3v or 5v to stm8 Vdd, check its voltage
+
+Check dmx operation of the device first. Then solder on connections
+if it doesn't work, cut the trace?
+
+
+Change ssid to be right
