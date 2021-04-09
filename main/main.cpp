@@ -34,7 +34,7 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-static const char *TAG = "wifi station";
+static const char *TAG = "main";
 
 static int s_retry_num = 0;
 
@@ -44,11 +44,10 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        } else {
+        esp_wifi_connect();
+        s_retry_num++;
+        ESP_LOGI(TAG, "retry to connect to the AP");
+        if (s_retry_num == EXAMPLE_ESP_MAXIMUM_RETRY) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
         ESP_LOGI(TAG,"connect to the AP fail");
@@ -93,6 +92,7 @@ static void wifi_init_sta(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start() );
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
@@ -126,10 +126,10 @@ ArtNetBaseClass<0, 1> artnet;
 esp_dmx_t dmx;
 
 SemaphoreHandle_t arrive_sem;
-uint8_t arrive_buf[512] = { 0 };
+uint8_t arrive_buf[MAX_DATA_SLOTS] = { 0 };
 int arrive_len = 0;
 SemaphoreHandle_t out_sem;
-uint8_t out_buf[513] = { 0 };
+uint8_t out_buf[MAX_SLOTS] = { 0 };
 int out_len = 0;
 TaskHandle_t copy_task_h = nullptr;
 
@@ -137,19 +137,19 @@ void copy_task(void *arg){
     while(true){
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        //ESP_LOGI(TAG, "copy task");
         // Wait on the output sem first
         xSemaphoreTake(out_sem, portMAX_DELAY);
         xSemaphoreTake(arrive_sem, portMAX_DELAY);
 
         memcpy(out_buf + 1, arrive_buf, arrive_len);
-        out_len = arrive_len;
+        out_len = arrive_len + 1;
 
         xSemaphoreGive(arrive_sem);
         xSemaphoreGive(out_sem);
     }
 }
 
+// Have to be fast otherwise
 void data_rx(uint8_t *data, int len){
     xSemaphoreTake(arrive_sem, portMAX_DELAY);
     memcpy(arrive_buf, data, len);
@@ -158,20 +158,32 @@ void data_rx(uint8_t *data, int len){
     xTaskNotifyGive(copy_task_h);
 }
 
+// Take as long as you want
 static uint8_t *dmx_buf_cb(void *arg, uint16_t *frame_sz){
     xSemaphoreTake(out_sem, portMAX_DELAY);
-    ESP_LOGI(TAG, "tx [%d] = {%d %d ...", out_len, out_buf[0], out_buf[1]);
     *frame_sz = out_len;
     return out_buf;
 } 
 
 static void post_dmx_cb(void *arg){
-    ESP_LOGI(TAG, "post tx");
     xSemaphoreGive(out_sem);
 } 
 
+static void blink(void *arg){
+    gpio_set_direction(GPIO_NUM_5, GPIO_MODE_OUTPUT);
+    while(true){
+        gpio_set_level(GPIO_NUM_5, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        gpio_set_level(GPIO_NUM_5, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 void app_main(void)
 {
+    // Start blink task to indicate power
+    xTaskCreate(blink, "blink", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+
     //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -180,15 +192,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+    // Connect to wifi
     wifi_init_sta();
 
-    arrive_sem = xSemaphoreCreateMutex();
-    out_sem = xSemaphoreCreateBinary();
-    xSemaphoreGive(out_sem);
-    xTaskCreate(copy_task, "copyTask", 2048, NULL, tskIDLE_PRIORITY+1, &copy_task_h);
 
-
+    // Configure dmx output
     esp_dmx_init_cfg_t dmx_cfg = ESP_DMX_INIT_CFG_DEFAULT();
     dmx_cfg.uart = UART_NUM_1;
     esp_dmx_tx_cfg_t dmx_tx_cfg = ESP_DMX_INIT_TX_DEFAULT();
@@ -204,12 +212,6 @@ void app_main(void)
         return;
     }
 
-    err = esp_dmx_start(&dmx);
-    if(err){
-        ESP_LOGE(TAG, "errror starting dmx %d", err);
-        return;
-    }
-
     // Configure Art-Net
     artnet.begin(ST_NODE);
     artnet.setShortName("ANToDmx");
@@ -218,4 +220,9 @@ void app_main(void)
     artnet.setSubNetAddress(0);
     artnet.setOutputUniverseAddress(0, 1);
     artnet.setDataReceivedCallback(0, data_rx);
+
+    arrive_sem = xSemaphoreCreateMutex();
+    out_sem = xSemaphoreCreateBinary();
+    xSemaphoreGive(out_sem);
+    xTaskCreate(copy_task, "copyTask", 2048, NULL, tskIDLE_PRIORITY+1, &copy_task_h);
 }
